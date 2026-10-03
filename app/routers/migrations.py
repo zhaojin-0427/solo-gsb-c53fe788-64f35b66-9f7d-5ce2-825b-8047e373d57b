@@ -41,6 +41,19 @@ success audit rolled back (it leaves no session); the same key with the same
 request body replays the committed winner (200); the per-source open/completed
 indexes yield 409 ``MIGRATION_CONFLICT``; any other 23505 or database error is
 re-raised verbatim and never misreported as a conflict.
+
+The winner re-read after the savepoint rollback uses the **same liveness
+predicate as the idempotent-replay lookup** (``open`` and ``completed`` both
+count as live winners): the winner's session may transition ``open`` →
+``completed`` (source threshold reached) between its commit and the loser's
+re-read, and a completed session is still bound to the idempotency key —
+reading only ``open`` rows would miss that committed winner and re-raise the
+database exception with no denial audit. Rows in a terminal state
+(``expired``/``failed``/``destroyed``) never act as the winner: if the row
+that held the index has since terminated, the key placeholder is free and the
+creation is re-validated under the post-terminal rebuild rules (a bounded
+insert retry), exactly as if the request had arrived after the terminal
+transition.
 """
 from __future__ import annotations
 
@@ -465,40 +478,57 @@ async def start_migration(
                     target_digest = _digest_of_policy(target_policy)
                     migration_id = deps.new_id("mig")
                     # savepoint：唯一索引兜底命中后外层事务仍可用于留痕/返回。
-                    try:
-                        async with conn.transaction():
-                            await conn.execute(
-                                """
-                                INSERT INTO migration_sessions
-                                  (id, tenant_id, source_custody_id, source_policy_id,
-                                   source_version, source_digest, target_policy_id,
-                                   target_version, target_digest, idempotency_key_hash,
-                                   status, valid_until)
-                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',
-                                        now() + ($11 || ' seconds')::interval)
-                                """,
-                                migration_id, tenant["id"], custody["id"],
-                                custody["policy_id"], custody["policy_version"], source_digest,
-                                body.target_policy_id, body.target_version, target_digest,
-                                idem_hash, str(ttl),
+                    # 有界重试：撞 uq_migration_idem_open 的胜方若在重读前已转入
+                    # expired/failed/destroyed 终态，则键位已释放——终态行不充当
+                    # 赢家，按终态后重建规则重新校验创建（重试 INSERT）；连续
+                    # churn 耗尽重试则原样上抛最后一次违规，绝不误判。
+                    replay_row = None
+                    last_exc: asyncpg.UniqueViolationError | None = None
+                    for _attempt in range(3):
+                        try:
+                            async with conn.transaction():
+                                await conn.execute(
+                                    """
+                                    INSERT INTO migration_sessions
+                                      (id, tenant_id, source_custody_id, source_policy_id,
+                                       source_version, source_digest, target_policy_id,
+                                       target_version, target_digest, idempotency_key_hash,
+                                       status, valid_until)
+                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',
+                                            now() + ($11 || ' seconds')::interval)
+                                    """,
+                                    migration_id, tenant["id"], custody["id"],
+                                    custody["policy_id"], custody["policy_version"], source_digest,
+                                    body.target_policy_id, body.target_version, target_digest,
+                                    idem_hash, str(ttl),
+                                )
+                        except asyncpg.UniqueViolationError as exc:
+                            # 并发兜底：同键 open / 同源 open / 同源已完成都可能在此。
+                            # 必须按“实际命中的约束名”分派，绝不能只凭 SQLSTATE=23505：
+                            # 其它唯一约束（主键、注入的非目标 23505）必须原样上抛。
+                            # 唯一索引的等待解析时胜方事务必然已提交（见
+                            # _resolve_unique_conflict 内的可见性复核）。
+                            last_exc = exc
+                            replay_row = await _resolve_unique_conflict(
+                                conn,
+                                request=request,
+                                exc=exc,
+                                tenant_id=tenant["id"],
+                                idem_hash=idem_hash,
+                                source_custody_id=custody["id"],
+                                target_policy_id=body.target_policy_id,
+                                target_version=body.target_version,
                             )
-                    except asyncpg.UniqueViolationError as exc:
-                        # 并发兜底：同键 open / 同源 open / 同源已完成都可能在此。
-                        # 必须按“实际命中的约束名”分派，绝不能只凭 SQLSTATE=23505：
-                        # 其它唯一约束（主键、注入的非目标 23505）必须原样上抛。
-                        # 唯一索引的等待解析时胜方事务必然已提交（见
-                        # _resolve_unique_conflict 内的可见性复核）。
-                        replay_row = await _resolve_unique_conflict(
-                            conn,
-                            exc=exc,
-                            tenant_id=tenant["id"],
-                            idem_hash=idem_hash,
-                            source_custody_id=custody["id"],
-                            target_policy_id=body.target_policy_id,
-                            target_version=body.target_version,
-                        )
+                            if replay_row is _RETRY_INSERT:
+                                replay_row = None
+                                continue
+                            break
+                        else:
+                            replay_row = None
+                            break
                     else:
-                        replay_row = None
+                        # 连续重试仍撞索引（病态 churn）：原样上抛，绝不误判。
+                        raise last_exc
                     if replay_row is not None:
                         # 同键同请求的并发创建：胜方会话已提交，按幂等重放
                         # 返回那同一份（200，不新建、不重复留痕）。
@@ -557,9 +587,18 @@ async def start_migration(
     return out
 
 
+#: Sentinel returned by :func:`_resolve_unique_conflict` when the row that won
+#: the unique race has since reached a terminal state (expired / failed /
+#: destroyed): terminal rows never act as the idempotency winner, the key
+#: placeholder is free, and the creation is re-validated under the
+#: post-terminal rebuild rules (the caller retries the insert, bounded).
+_RETRY_INSERT: object = object()
+
+
 async def _resolve_unique_conflict(
     conn,
     *,
+    request: Request,
     exc: asyncpg.UniqueViolationError,
     tenant_id: str,
     idem_hash: str,
@@ -572,10 +611,17 @@ async def _resolve_unique_conflict(
     Classification is driven by the **actual constraint name** carried by the
     database error, never by SQLSTATE alone:
 
-    * ``uq_migration_idem_open`` — another request already committed an open
-      session under the same ``(tenant, idempotency_key)``. Same request body →
-      replay that winner (returns its row, HTTP 200); different source/target →
-      deterministic 409 ``IDEMPOTENCY_CONFLICT``.
+    * ``uq_migration_idem_open`` — another request already committed a session
+      under the same ``(tenant, idempotency_key)``. The committed winner is
+      re-read with the **same liveness predicate as the idempotent-replay
+      lookup** (``open`` and ``completed``; the winner may have transitioned
+      ``open`` → ``completed`` between its commit and this re-read, and a
+      completed session is still bound to the key). Same request body →
+      replay that winner (returns its row, HTTP 200); different source/target
+      → deterministic 409 ``IDEMPOTENCY_CONFLICT``. A winner that has since
+      reached a terminal state (``expired``/``failed``/``destroyed``) never
+      counts: the placeholder is free, so the caller re-validates the creation
+      under the post-terminal rebuild rules (bounded insert retry).
     * ``uq_migration_source_open`` / ``uq_migration_source_completed`` —
       another open / already-completed session for the same source custody →
       deterministic 409 ``MIGRATION_CONFLICT``.
@@ -584,8 +630,8 @@ async def _resolve_unique_conflict(
 
     A partial-unique-index conflict in READ COMMITTED only resolves once the
     winning transaction has committed, so every winner lookup here observes the
-    committed row; a missing row (winner also rolled back) is treated as "not
-    our conflict" and the original database exception is re-raised.
+    committed row; a missing live row (winner terminated meanwhile) is handled
+    as described above instead of leaking the raw database exception.
     """
     constraint = getattr(exc, "constraint_name", None)
     if constraint not in (
@@ -596,21 +642,30 @@ async def _resolve_unique_conflict(
         raise exc
 
     if constraint == "uq_migration_idem_open":
+        # 保存点已回滚、重读已提交胜方之前：测试可在此钉住“胜方由 open 转
+        # completed / 终态”的交错（仅测试构建启用，见 race_migration_start）。
+        await faults.maybe_park(request, "migration.after_insert_conflict")
+        # 与主流程幂等重放同一判定：open 与 completed 都是有效赢家（completed
+        # 仍绑定该幂等键，可重放）；expired/failed/destroyed 终态行不充当赢家。
+        # 只读 status='open' 会漏掉“重读前已由 open 转 completed”的已提交赢家，
+        # 把确定性的幂等冲突误判成未处理的数据库异常（500）并漏记拒绝审计。
         winner = await conn.fetchrow(
             "SELECT * FROM migration_sessions "
-            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status='open' "
+            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
+            "AND status NOT IN ('expired','failed','destroyed') "
             "ORDER BY created_at DESC LIMIT 1",
             tenant_id, idem_hash,
         )
         if winner is None:
-            # 占位行不可见（胜方也回滚了）：这不是确定性冲突，原样上抛。
-            raise exc
+            # 撞索引的行已转入终态（expired/failed/destroyed）：键位已释放，
+            # 终态行不充当赢家——按终态后重建规则重新校验创建（有界重试）。
+            return _RETRY_INSERT
         if (
             winner["source_custody_id"] == source_custody_id
             and winner["target_policy_id"] == target_policy_id
             and winner["target_version"] == target_version
         ):
-            # 同键同请求的并发创建：重放胜方那一份会话（200）。
+            # 同键同请求的并发创建：重放胜方那一份会话（200，含已完成态）。
             return winner
         raise ApiError(
             E_IDEMPOTENCY_CONFLICT,

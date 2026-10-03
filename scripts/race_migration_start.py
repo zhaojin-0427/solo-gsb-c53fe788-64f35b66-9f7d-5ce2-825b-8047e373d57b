@@ -34,6 +34,19 @@ Expected behavior after the fix (v1.7):
       session insert is rolled back and the same key retries cleanly.
   S6  a generic (non-unique) mid-transaction failure at the same gate is a
       500 — never a 409 conflict; same key retries cleanly afterwards.
+  S7  completed-winner race: the loser of the ``uq_migration_idem_open`` race
+      is parked at ``migration.after_insert_conflict`` (savepoint already
+      rolled back, winner re-read pending) while the winner's session is
+      driven ``open`` → ``completed`` by real custodian share submits. The
+      re-read must still adjudicate the committed winner: deterministic 409
+      IDEMPOTENCY_CONFLICT (never an unhandled 500), no loser session, no
+      loser success audit, exactly one separate denial audit.
+  S8  terminal-winner race: same pinning, but the winner is driven into the
+      ``failed`` terminal state (committed share's in-memory plaintext lost,
+      gap detector commits ``failed``) before the loser re-reads. Terminal
+      rows never act as the winner: the loser's creation is re-validated
+      under the post-terminal rebuild rules and succeeds with its own 201
+      session — the key placeholder is free again.
 """
 from __future__ import annotations
 
@@ -47,6 +60,7 @@ import sys
 os.environ.setdefault("KEYVAULT_FAULT_INJECTION", "1")
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.config import get_settings
 from app.crypto import sha256_hex
@@ -70,6 +84,12 @@ def body_of(r) -> dict:
         return r.json()
     except Exception:  # noqa: BLE001
         return {}
+
+
+def sign(priv_hex: str, message: str) -> str:
+    return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex)).sign(
+        message.encode()
+    ).hex()
 
 
 class _Raw500:
@@ -136,6 +156,7 @@ class Harness:
         self.http = http
         self.pool = pool
         self.tenant_key = creds["tenant"]["api_key"]
+        self.cust = {c["name"]: c for c in creds["custodians"]}
         self.secret = b"migration-start-idempotency-regression-012345"
 
     async def make_source_and_target(self, tag: str) -> tuple[str, str, str]:
@@ -195,6 +216,35 @@ class Harness:
             "WHERE action='migration.start' AND result='ok' AND resource IN "
             "(SELECT id FROM migration_sessions WHERE source_custody_id=$1)",
             cid)
+
+    def h(self, name: str) -> dict:
+        return auth(self.cust[name]["api_key"])
+
+    async def prep(self, name: str, mid: str) -> dict:
+        """Custodian nonce -> claim -> sign for a migration session."""
+        h = self.h(name)
+        r = await self.http.post("/migrations/nonces", headers=h, json={"migration_id": mid})
+        assert r.status_code == 200, r.text
+        nonce = r.json()["nonce"]
+        r = await self.http.post("/migrations/shards/claim", headers=h,
+                                 json={"migration_id": mid, "nonce": nonce})
+        assert r.status_code == 200, r.text
+        c = r.json()
+        return {
+            "headers": dict(h),
+            "json": {"migration_id": mid, "nonce": nonce, "point_x": c["point_x"],
+                     "shard_hex": c["shard_hex"],
+                     "signature": sign(self.cust[name]["signing_private_key"],
+                                       c["signing_message"])},
+        }
+
+    async def submit(self, prepped: dict):
+        return await self.http.post("/migrations/shares", headers=prepped["headers"],
+                                    json=prepped["json"])
+
+    async def mig_row(self, mid: str):
+        return await self.pool.fetchrow(
+            "SELECT status, new_custody_id FROM migration_sessions WHERE id=$1", mid)
 
 
 async def scenario_s1(hs: Harness, board: FaultBoard, tag: str) -> None:
@@ -407,6 +457,184 @@ async def scenario_s6(hs: Harness, tag: str) -> None:
           f"{rr.status_code} {rr.text[:160]}")
 
 
+async def scenario_s7(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """Winner goes open->completed before the loser's re-read: still a 409.
+
+    The loser's INSERT hits ``uq_migration_idem_open``; after the savepoint
+    rollback it is parked at ``migration.after_insert_conflict`` while the
+    winner's session is completed by real custodian submits. The re-read must
+    adjudicate the committed (now completed) winner — never re-raise the
+    database exception as an unhandled 500 or skip the denial audit.
+    """
+    label = "S7(winner-open-to-completed)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    _, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s7-{tag}"
+    gate_a = {"X-Fault-Key": f"{label}-a",
+              "X-Fault-Gate": "migration.after_idem_check"}
+    gate_b = {"X-Fault-Key": f"{label}-b",
+              "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict"}
+
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, gate_a))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gate_b))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+
+    # 先放行 A：完整提交 201（open）。
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: first request -> 201 open session",
+          ra.status_code == 201 and body_of(ra).get("status") == "open"
+          and bool(winner_id), f"{ra.status_code} {ra.text[:200]}")
+
+    # 放行 B 的预查：INSERT 撞 uq_migration_idem_open，保存点回滚后钉在重读之前。
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+
+    # 胜方在败方重读前由 open 转 completed（真实提交达到源门限 2/3）。
+    pa = await hs.prep("alice", winner_id)
+    pb = await hs.prep("bob", winner_id)
+    r1 = await hs.submit(pa)
+    r2 = await hs.submit(pb)
+    done = body_of(r2)
+    check(f"{label}: winner driven open->completed while loser parked",
+          r1.status_code == 200 and r2.status_code == 200
+          and done.get("completed") is True and bool(done.get("new_custody_id")),
+          f"{r1.status_code}/{r2.status_code} {r2.text[:200]}")
+    row = await hs.mig_row(winner_id)
+    check(f"{label}: winner session committed as completed",
+          row is not None and row["status"] == "completed"
+          and row["new_custody_id"] is not None,
+          str(dict(row) if row else None))
+
+    # 放行败方重读：completed 赢家必须被判出 -> 稳定 409，绝不能 500。
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    err = body_of(rb).get("error", {})
+    check(f"{label}: loser -> stable 409 IDEMPOTENCY_CONFLICT (not 500)",
+          rb.status_code == 409 and err.get("code") == "IDEMPOTENCY_CONFLICT"
+          and err.get("basis", {}).get("reason") == "concurrent_open_with_same_idempotency_key"
+          and err.get("basis", {}).get("migration_id") == winner_id,
+          f"{rb.status_code} {rb.text[:240]}")
+
+    # 败方不留下会话、不留成功审计；恰一条独立拒绝审计。
+    check(f"{label}: loser left no migration session",
+          await hs.sessions_for_source(cid_b) == [])
+    check(f"{label}: loser has no migration.start ok audit",
+          await hs.ok_audits(cid_b) == 0)
+    denied_b = await hs.denied_audits(cid_b)
+    check(f"{label}: loser has exactly one denial audit (IDEMPOTENCY_CONFLICT)",
+          len(denied_b) == 1 and denied_b[0]["error_code"] == "IDEMPOTENCY_CONFLICT",
+          str(denied_b))
+    raw = json.dumps(denied_b)
+    check(f"{label}: denial audit carries no plaintext secret",
+          hs.secret.hex() not in raw and key not in raw)
+
+    # 胜方完成态可查询；键仍绑定胜方请求：串行同键异源重试同样 409。
+    g = await hs.http.get(f"/migrations/{winner_id}", headers=auth(hs.tenant_key))
+    check(f"{label}: winner queryable as completed with new custody",
+          g.status_code == 200 and body_of(g).get("status") == "completed"
+          and body_of(g).get("new_custody_id") == done.get("new_custody_id"),
+          g.text[:200])
+    rr = await hs.start(cid_b, tgt_b, key)
+    check(f"{label}: serial same-key different-source retry -> 409 (key still bound)",
+          rr.status_code == 409
+          and body_of(rr).get("error", {}).get("code") == "IDEMPOTENCY_CONFLICT",
+          f"{rr.status_code} {rr.text[:200]}")
+    # 败方换新键即可成功发起。
+    rr2 = await hs.start(cid_b, tgt_b, f"s7-retry-{tag}")
+    check(f"{label}: loser retries with a fresh key -> 201",
+          rr2.status_code == 201 and body_of(rr2).get("status") == "open"
+          and body_of(rr2).get("source_custody_id") == cid_b,
+          f"{rr2.status_code} {rr2.text[:200]}")
+
+
+async def scenario_s8(hs: Harness, board: FaultBoard, tag: str) -> None:
+    """Winner goes open->failed before the loser's re-read: loser re-creates.
+
+    A terminal-state row (expired/failed/destroyed) never acts as the winner:
+    once the winner's session commits ``failed``, the key placeholder is free
+    and the loser's parked creation is re-validated under the post-terminal
+    rebuild rules — it must succeed with its own 201 session, not 500/409.
+    """
+    label = "S8(winner-open-to-failed)"
+    _, tgt_a, cid_a = await hs.make_source_and_target(f"{tag}a")
+    _, tgt_b, cid_b = await hs.make_source_and_target(f"{tag}b")
+    key = f"s8-{tag}"
+    gate_a = {"X-Fault-Key": f"{label}-a",
+              "X-Fault-Gate": "migration.after_idem_check"}
+    gate_b = {"X-Fault-Key": f"{label}-b",
+              "X-Fault-Gate": "migration.after_idem_check,migration.after_insert_conflict"}
+
+    ta = asyncio.create_task(hs.start(cid_a, tgt_a, key, gate_a))
+    tb = asyncio.create_task(hs.start(cid_b, tgt_b, key, gate_b))
+    await board.wait_reached(f"migration.after_idem_check:{label}-a")
+    await board.wait_reached(f"migration.after_idem_check:{label}-b")
+
+    await board.release_gate(f"migration.after_idem_check:{label}-a")
+    ra = await ta
+    winner_id = body_of(ra).get("migration_id")
+    check(f"{label}: first request -> 201 open session",
+          ra.status_code == 201 and body_of(ra).get("status") == "open"
+          and bool(winner_id), f"{ra.status_code} {ra.text[:200]}")
+
+    await board.release_gate(f"migration.after_idem_check:{label}-b")
+    await board.wait_reached(f"migration.after_insert_conflict:{label}-b")
+
+    # 胜方在败方重读前转入 failed 终态：首名托管人提交后内存分片丢失
+    # （模拟重启/淘汰），第二名托管人的提交检出缺片，同事务置 failed。
+    pa = await hs.prep("alice", winner_id)
+    r1 = await hs.submit(pa)
+    check(f"{label}: winner first share committed (1/2)",
+          r1.status_code == 200 and body_of(r1).get("shares_received") == 1,
+          r1.text[:200])
+    app.state.pending.clear(winner_id)
+    pb = await hs.prep("bob", winner_id)
+    r2 = await hs.submit(pb)
+    err2 = body_of(r2).get("error", {})
+    check(f"{label}: gap detector fails the winner session",
+          r2.status_code == 409 and err2.get("code") == "THRESHOLD_NOT_MET"
+          and err2.get("basis", {}).get("migration_status") == "failed",
+          f"{r2.status_code} {r2.text[:200]}")
+    row = await hs.mig_row(winner_id)
+    check(f"{label}: winner session committed as failed terminal state",
+          row is not None and row["status"] == "failed"
+          and row["new_custody_id"] is None,
+          str(dict(row) if row else None))
+
+    # 放行败方重读：failed 终态行不充当赢家 -> 按终态后重建规则重新创建（201）。
+    await board.release_gate(f"migration.after_insert_conflict:{label}-b")
+    rb = await tb
+    body_b = body_of(rb)
+    check(f"{label}: loser re-creates after winner terminal state -> 201 open",
+          rb.status_code == 201 and body_b.get("status") == "open"
+          and body_b.get("source_custody_id") == cid_b
+          and body_b.get("migration_id") != winner_id,
+          f"{rb.status_code} {rb.text[:240]}")
+
+    # 败方（现在是合法创建者）留下自己的会话与成功审计；无拒绝审计。
+    rows_b = await hs.sessions_for_source(cid_b)
+    check(f"{label}: loser has exactly its own new session",
+          len(rows_b) == 1 and rows_b[0]["id"] == body_b.get("migration_id")
+          and rows_b[0]["status"] == "open", str(rows_b))
+    check(f"{label}: loser has its migration.start ok audit",
+          await hs.ok_audits(cid_b) == 1)
+    check(f"{label}: loser has no denial audit",
+          await hs.denied_audits(cid_b) == [])
+    # 键位现在由败方的新会话持有：同键同体重放 200，同键异源 409。
+    rr = await hs.start(cid_b, tgt_b, key)
+    check(f"{label}: same key + same body replays the rebuilt session (200)",
+          rr.status_code == 200
+          and body_of(rr).get("migration_id") == body_b.get("migration_id"),
+          f"{rr.status_code} {rr.text[:200]}")
+    rr2 = await hs.start(cid_a, tgt_a, key)
+    check(f"{label}: same key + different body -> 409 IDEMPOTENCY_CONFLICT",
+          rr2.status_code == 409
+          and body_of(rr2).get("error", {}).get("code") == "IDEMPOTENCY_CONFLICT",
+          f"{rr2.status_code} {rr2.text[:200]}")
+
+
 async def amain() -> int:
     async with server() as (http, pool, board):
         creds = demo_credentials()
@@ -418,6 +646,8 @@ async def amain() -> int:
         await scenario_s4(hs, board, f"{suffix}4")
         await scenario_s5(hs, f"{suffix}5")
         await scenario_s6(hs, f"{suffix}6")
+        await scenario_s7(hs, board, f"{suffix}7")
+        await scenario_s8(hs, board, f"{suffix}8")
 
         r = await http.get("/audit/replay", headers=auth(hs.tenant_key))
         check("final: audit hash chain valid across start-race scenarios",
