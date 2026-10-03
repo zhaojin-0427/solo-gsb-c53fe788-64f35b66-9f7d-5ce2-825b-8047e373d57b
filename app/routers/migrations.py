@@ -34,13 +34,20 @@ valid source custody records** cannot be serialized by the source row locks
 (they are disjoint), so both requests can pass every pre-check; the loser's
 session insert then hits ``uq_migration_idem_open``. The unique-violation
 handler classifies by the **actual constraint name** (never by SQLSTATE
-alone): that partial index with a committed winner bound to a different
-request degrades to a deterministic 409 ``IDEMPOTENCY_CONFLICT`` and a
-separate ``migration.start`` denial audit, with the loser's session insert and
-success audit rolled back (it leaves no session); the same key with the same
-request body replays the committed winner (200); the per-source open/completed
-indexes yield 409 ``MIGRATION_CONFLICT``; any other 23505 or database error is
-re-raised verbatim and never misreported as a conflict.
+alone): that partial index with a committed, still-live winner bound to a
+different request degrades to a deterministic 409 ``IDEMPOTENCY_CONFLICT``
+and a separate ``migration.start`` denial audit, with the loser's session
+insert and success audit rolled back (it leaves no session); the same key
+with the same request body replays the committed winner (200) whether it is
+still ``open`` or already ``completed`` (the winner keeps running on its own
+source custody while the loser parks after the savepoint rollback, so an
+``open``→``completed`` transition before the re-read must not be missed); a
+winner that reached ``expired``/``failed``/``destroyed`` occupies no partial
+index and never serves as a winner — the loser re-validates source and
+target under its still-held source row lock and re-creates the session; the
+per-source open/completed indexes yield 409 ``MIGRATION_CONFLICT``; any
+other 23505 or database error is re-raised verbatim and never misreported
+as a conflict.
 """
 from __future__ import annotations
 
@@ -461,44 +468,137 @@ async def start_migration(
                     await faults.maybe_park(request, "migration.after_idem_check")
                     await faults.maybe_raise(request, "migration.after_idem_check")
 
-                    source_digest = _digest_of_policy(source_policy)
-                    target_digest = _digest_of_policy(target_policy)
-                    migration_id = deps.new_id("mig")
-                    # savepoint：唯一索引兜底命中后外层事务仍可用于留痕/返回。
-                    try:
-                        async with conn.transaction():
-                            await conn.execute(
-                                """
-                                INSERT INTO migration_sessions
-                                  (id, tenant_id, source_custody_id, source_policy_id,
-                                   source_version, source_digest, target_policy_id,
-                                   target_version, target_digest, idempotency_key_hash,
-                                   status, valid_until)
-                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',
-                                        now() + ($11 || ' seconds')::interval)
-                                """,
-                                migration_id, tenant["id"], custody["id"],
-                                custody["policy_id"], custody["policy_version"], source_digest,
-                                body.target_policy_id, body.target_version, target_digest,
-                                idem_hash, str(ttl),
+                    # 有界重试：唯一索引兜底命中后按“实际约束”重读已提交的
+                    # 胜方。若胜方在冲突解析前已离开占位（open→completed 被
+                    # 正常重放裁决；open→expired/failed/destroyed 后不再充当
+                    # 赢家），占位索引已重新释放，本请求在仍持有的源行锁内
+                    # 重新校验源/目标有效性并再次 INSERT。胜方在其它源上，
+                    # 状态翻转可在本请求持锁期间反复发生，因此限次兜底。
+                    replay_row = None
+                    created_migration_id = None
+                    created_source_digest = _digest_of_policy(source_policy)
+                    created_target_digest = _digest_of_policy(target_policy)
+                    for attempt in range(3):
+                        migration_id = deps.new_id("mig")
+                        # savepoint：唯一索引兜底命中后外层事务仍可用于重读、
+                        # 留痕或重试。
+                        try:
+                            async with conn.transaction():
+                                await conn.execute(
+                                    """
+                                    INSERT INTO migration_sessions
+                                      (id, tenant_id, source_custody_id, source_policy_id,
+                                       source_version, source_digest, target_policy_id,
+                                       target_version, target_digest, idempotency_key_hash,
+                                       status, valid_until)
+                                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',
+                                            now() + ($11 || ' seconds')::interval)
+                                    """,
+                                    migration_id, tenant["id"], custody["id"],
+                                    custody["policy_id"], custody["policy_version"],
+                                    created_source_digest,
+                                    body.target_policy_id, body.target_version,
+                                    created_target_digest,
+                                    idem_hash, str(ttl),
+                                )
+                            created_migration_id = migration_id
+                            break
+                        except asyncpg.UniqueViolationError as exc:
+                            # 并发兜底：同键 open/已完成 / 同源 open / 同源已完成
+                            # 都可能在此。必须按“实际命中的约束名”分派，绝不能只
+                            # 凭 SQLSTATE=23505：其它唯一约束（主键、注入的非目标
+                            # 23505）必须原样上抛。部分唯一索引的冲突在 READ
+                            # COMMITTED 下只可能在胜方事务提交后解析；但胜方提交后
+                            # 又可能在我们重读前离开占位（open→completed/expired/
+                            # failed/destroyed），故重读必须覆盖全部终态事实。
+                            verdict = await _resolve_unique_conflict(
+                                conn,
+                                request=request,
+                                exc=exc,
+                                tenant_id=tenant["id"],
+                                idem_hash=idem_hash,
+                                source_custody_id=custody["id"],
+                                target_policy_id=body.target_policy_id,
+                                target_version=body.target_version,
                             )
-                    except asyncpg.UniqueViolationError as exc:
-                        # 并发兜底：同键 open / 同源 open / 同源已完成都可能在此。
-                        # 必须按“实际命中的约束名”分派，绝不能只凭 SQLSTATE=23505：
-                        # 其它唯一约束（主键、注入的非目标 23505）必须原样上抛。
-                        # 唯一索引的等待解析时胜方事务必然已提交（见
-                        # _resolve_unique_conflict 内的可见性复核）。
-                        replay_row = await _resolve_unique_conflict(
-                            conn,
-                            exc=exc,
-                            tenant_id=tenant["id"],
-                            idem_hash=idem_hash,
-                            source_custody_id=custody["id"],
-                            target_policy_id=body.target_policy_id,
-                            target_version=body.target_version,
-                        )
+                            if verdict["kind"] != "retry":
+                                replay_row = verdict.get("row")
+                                break
+                            # 胜方已离开占位（终态行不再占部分唯一索引）：按
+                            # “终态后重建”规则重新校验后再试 INSERT。
+                            custody = await conn.fetchrow(
+                                "SELECT * FROM key_custodies WHERE id = $1 FOR UPDATE",
+                                body.source_custody_id,
+                            )
+                            if custody["tenant_id"] != tenant["id"]:
+                                raise ApiError(E_FORBIDDEN,
+                                               basis={"reason": "custody_belongs_to_other_tenant"})
+                            if custody["status"] == "destroyed":
+                                raise ApiError(
+                                    E_CUSTODY_DESTROYED,
+                                    basis={"custody_id": custody["id"],
+                                           "custody_status": custody["status"]},
+                                )
+                            if custody["status"] != "active":
+                                raise ApiError(
+                                    E_MIGRATION_SOURCE_INVALID,
+                                    basis={"custody_id": custody["id"],
+                                           "custody_status": custody["status"],
+                                           "policy_id": custody["policy_id"],
+                                           "version": custody["policy_version"]},
+                                )
+                            source_policy = await repo.get_policy_version(
+                                conn, custody["policy_id"], custody["policy_version"]
+                            )
+                            if source_policy["status"] == "revoked" or now >= source_policy["epoch_valid_until"]:
+                                raise ApiError(
+                                    E_MIGRATION_SOURCE_INVALID,
+                                    basis={"reason": "source_policy_no_longer_valid",
+                                           "policy_id": custody["policy_id"],
+                                           "version": custody["policy_version"],
+                                           "policy_status": source_policy["status"]},
+                                )
+                            target_policy = await repo.get_policy_version(
+                                conn, body.target_policy_id, body.target_version
+                            )
+                            if target_policy is None or target_policy["tenant_id"] != tenant["id"]:
+                                raise ApiError(
+                                    E_FORBIDDEN if target_policy is not None else E_MIGRATION_TARGET_INVALID,
+                                    basis={"reason": "target_policy_belongs_to_other_tenant"
+                                           if target_policy is not None
+                                           else "target_version_not_found",
+                                           "policy_id": body.target_policy_id,
+                                           "version": body.target_version},
+                                )
+                            if (
+                                body.target_policy_id == custody["policy_id"]
+                                and body.target_version == custody["policy_version"]
+                            ):
+                                raise ApiError(
+                                    E_MIGRATION_TARGET_INVALID,
+                                    basis={"reason": "target_identical_to_source",
+                                           "policy_id": body.target_policy_id,
+                                           "version": body.target_version},
+                                )
+                            if target_policy["status"] != "active" or now >= target_policy["epoch_valid_until"]:
+                                raise ApiError(
+                                    E_MIGRATION_TARGET_INVALID,
+                                    basis={"reason": "target_policy_no_longer_valid",
+                                           "policy_id": body.target_policy_id,
+                                           "version": body.target_version,
+                                           "status": target_policy["status"]},
+                                )
+                            created_source_digest = _digest_of_policy(source_policy)
+                            created_target_digest = _digest_of_policy(target_policy)
                     else:
-                        replay_row = None
+                        # 理论上不可达：连续重试都被反复翻转的胜方占位挤出。
+                        # 不做静默吞错，原样升级为完整性错误，绝不误判为冲突。
+                        raise ApiError(
+                            E_INTEGRITY,
+                            basis={"reason": "migration_insert_retry_exhausted",
+                                   "source_custody_id": custody["id"],
+                                   "attempts": 3},
+                        )
                     if replay_row is not None:
                         # 同键同请求的并发创建：胜方会话已提交，按幂等重放
                         # 返回那同一份（200，不新建、不重复留痕）。
@@ -522,21 +622,21 @@ async def start_migration(
                         await audit.append_audit(
                             conn, tenant_id=tenant["id"], actor_type="tenant",
                             actor_id=tenant["id"],
-                            action="migration.start", resource=migration_id, result="ok",
+                            action="migration.start", resource=created_migration_id, result="ok",
                             basis={
                                 "source_custody_id": custody["id"],
                                 "source_policy_id": custody["policy_id"],
                                 "source_version": custody["policy_version"],
-                                "source_digest": source_digest,
+                                "source_digest": created_source_digest,
                                 "target_policy_id": body.target_policy_id,
                                 "target_version": body.target_version,
-                                "target_digest": target_digest,
+                                "target_digest": created_target_digest,
                                 "ttl_seconds": ttl,
                                 "idempotency_key_digest": idem_hash,
                             },
                         )
                         mig_row = await conn.fetchrow(
-                            "SELECT * FROM migration_sessions WHERE id=$1", migration_id
+                            "SELECT * FROM migration_sessions WHERE id=$1", created_migration_id
                         )
                         out_count, out_new_digests = 0, None
                     source_threshold = source_policy["threshold"]
@@ -560,32 +660,46 @@ async def start_migration(
 async def _resolve_unique_conflict(
     conn,
     *,
+    request,
     exc: asyncpg.UniqueViolationError,
     tenant_id: str,
     idem_hash: str,
     source_custody_id: str,
     target_policy_id: str,
     target_version: int,
-):
+) -> dict:
     """Resolve a session-INSERT unique violation after the savepoint rolled back.
 
     Classification is driven by the **actual constraint name** carried by the
     database error, never by SQLSTATE alone:
 
     * ``uq_migration_idem_open`` — another request already committed an open
-      session under the same ``(tenant, idempotency_key)``. Same request body →
-      replay that winner (returns its row, HTTP 200); different source/target →
-      deterministic 409 ``IDEMPOTENCY_CONFLICT``.
+      session under the same ``(tenant, idempotency_key)``. The committed
+      winner may itself have moved on **before this re-read**: it can complete
+      normally (``open``→``completed``), expire, fail (pending-shares gap), or
+      be blocked by a logical destruction. The re-read therefore covers both
+      live states (``open``/``completed``):
+
+      - live winner + same request body → replay that winner (HTTP 200);
+      - live winner + different source/target → deterministic 409
+        ``IDEMPOTENCY_CONFLICT``;
+      - no live row (the winner rolled back or reached a non-live terminal
+        state) → ``retry``: ``expired``/``failed``/``destroyed`` rows do not
+        occupy the partial index and never serve as a winner, so the caller
+        re-validates source and target under the still-held source row lock
+        and creates the session anew.
     * ``uq_migration_source_open`` / ``uq_migration_source_completed`` —
       another open / already-completed session for the same source custody →
-      deterministic 409 ``MIGRATION_CONFLICT``.
+      deterministic 409 ``MIGRATION_CONFLICT``. Because the caller holds this
+      custody's row lock for the whole transaction, a session for *this*
+      custody cannot have changed state underneath us; a missing blocker row
+      means the violation came from somewhere else.
     * anything else (primary key, unrelated index, synthetic non-target 23505)
       is re-raised verbatim so it can never be misreported as a conflict.
 
     A partial-unique-index conflict in READ COMMITTED only resolves once the
-    winning transaction has committed, so every winner lookup here observes the
-    committed row; a missing row (winner also rolled back) is treated as "not
-    our conflict" and the original database exception is re-raised.
+    winning transaction has committed, so every live-winner lookup here
+    observes the committed row.
     """
     constraint = getattr(exc, "constraint_name", None)
     if constraint not in (
@@ -596,27 +710,39 @@ async def _resolve_unique_conflict(
         raise exc
 
     if constraint == "uq_migration_idem_open":
+        # 回归闸门：savepoint 已回滚、即将重读胜方会话之前（仅测试构建启用）。
+        # 钉住“败方撞 uq_migration_idem_open 后、重读前，胜方 open→completed”
+        # 的交错——胜方在另一条源 custody 上，其 nonce/claim/submit 与本请求
+        # 的行锁互不重叠，可在该窗口完成迁移。
+        await faults.maybe_park(request, "migration.after_idem_conflict")
+        await faults.maybe_raise(request, "migration.after_idem_conflict")
+        # 胜方提交后可能仍 open，也可能已完成：两种“有效(open/completed)”行
+        # 都要参与裁决；expired/failed/destroyed 行不再充当赢家（不占索引）。
         winner = await conn.fetchrow(
             "SELECT * FROM migration_sessions "
-            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status='open' "
+            "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
+            "AND status IN ('open','completed') "
             "ORDER BY created_at DESC LIMIT 1",
             tenant_id, idem_hash,
         )
         if winner is None:
-            # 占位行不可见（胜方也回滚了）：这不是确定性冲突，原样上抛。
-            raise exc
+            # 占位行不可见：胜方也回滚了，或胜方会话已进入 expired/failed/
+            # destroyed 终态（三条终态都不占部分唯一索引）。后一种情况按
+            # “终态后重建”规则重新校验创建，绝不拿终态行冒充赢家。
+            return {"kind": "retry"}
         if (
             winner["source_custody_id"] == source_custody_id
             and winner["target_policy_id"] == target_policy_id
             and winner["target_version"] == target_version
         ):
-            # 同键同请求的并发创建：重放胜方那一份会话（200）。
-            return winner
+            # 同键同请求的并发创建：重放胜方那一份会话（open 或 completed，200）。
+            return {"kind": "replay", "row": winner}
         raise ApiError(
             E_IDEMPOTENCY_CONFLICT,
             basis={"reason": "concurrent_open_with_same_idempotency_key",
                    "idempotency_key_digest": idem_hash,
                    "migration_id": winner["id"],
+                   "winner_status": winner["status"],
                    "winner_source_custody_id": winner["source_custody_id"]},
         )
 

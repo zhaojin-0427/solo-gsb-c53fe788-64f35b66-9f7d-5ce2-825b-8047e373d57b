@@ -66,6 +66,15 @@ Migration-session creation (v1.7, ``scripts.race_migration_start.py``) adds:
   unhandled database error with no denial audit. ``X-Fault-Fail`` values
   ``:RAISE`` and ``:UNIQUE:<non-target-constraint>`` at the same gate prove
   other failures are never misread as that conflict.
+* ``migration.after_idem_conflict`` — after the loser's session insert hit
+  ``uq_migration_idem_open`` and its savepoint rolled back, but **before** the
+  winner is re-read. A request parked here keeps holding only its own source
+  custody row lock; the winner (a different source custody) remains free, so
+  the test harness can drive the winner's custodians to complete it, pinning
+  the ``open``→``completed`` winner transition that used to make the loser
+  re-read miss the row and surface as an unhandled 500 with no denial audit.
+  ``X-Fault-Fail: migration.after_idem_conflict:RAISE`` also proves a generic
+  post-savepoint failure is not swallowed as a conflict or retry.
 
 Header protocol (only honored when fault injection is enabled):
 

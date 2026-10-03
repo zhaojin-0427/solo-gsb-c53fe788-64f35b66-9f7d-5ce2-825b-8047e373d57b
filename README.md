@@ -45,6 +45,29 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 另一次稳定 409）、D9b（同键同根并发重试得同一回执）、D9c（双闸门同时放行，
 > 结果集合恒为 {201, 409}）、D9d（通用故障仍是 500，不误判为幂等冲突）。
 
+> **修复要点（v1.7.1）**：修复 `POST /migrations` **已完成赢家漏判**。
+> 同一租户以同一个 `Idempotency-Key` **同时**为**两条不同且有效**的源托管记录发起
+> 迁移时，败方 INSERT 撞上 `uq_migration_idem_open`、savepoint 回滚——但胜方的
+> 源 custody 行锁与败方互不重叠，胜方会话**仍可继续被其源策略托管人提交分片**：
+> 在败方**重读之前**，胜方完全可能已由 `open` 转为 **`completed`**。旧代码重读只
+> 查 `status='open'`，于是查无此行，把原始 `UniqueViolationError` **原样上抛为未处理
+> 500**，也**漏记拒绝审计**。现改为保存点回滚后按**实际约束 + 已提交会话的真实
+> 状态**裁决：幂等键冲突的重读覆盖 **`open` 与 `completed` 两种有效行**——同请求体
+> 返回 **200 重放**（completed 即返回同一份会话与同一个新 custody），异请求返回
+> **409 `IDEMPOTENCY_CONFLICT`**（basis 带胜方 `migration_id` 与 `winner_status`），
+> 并由独立事务单独补一条 `migration.start`/`denied` 审计，败方**不留会话、不留成功
+> 审计**。胜方若在该窗口进入 **`expired`/`failed`/`destroyed`**，这三种终态行**不
+> 占部分唯一索引、绝不充当赢家**：败方在仍持有的源 custody 行锁内**重新校验源与
+> 目标**（active、未撤销、未过期、同租户）后**重新创建**会话。`uq_migration_source_open`
+> /`uq_migration_source_completed` 仍判 **409 `MIGRATION_CONFLICT`**（同源行锁自始
+> 至终被本请求持有，其间状态不可能翻转）；**非目标约束的 23505 与其它数据库错误
+> 原样上抛为 500，绝不误判**。交错由新闸门 `migration.after_idem_conflict`（savepoint
+> 回滚后、重读胜方前 park）钉死，回归验证见 `scripts/race_migration_start.py`：
+> S7（胜方 open→completed：败方稳定 409 且 basis `winner_status=completed`；同请求
+> completed 重放 200/同一新 custody；败方换新键可独立完成）、S8（胜方 open→
+> destroyed：终态行不充当赢家，败方重新校验后 201 且只留自己的成功审计）、
+> S9（重读前注入的通用故障仍是 500，不被吞成冲突/重试）。
+
 > **修复要点（v1.7）**：修复 `POST /migrations` **并发创建迁移会话的幂等错误**。
 > 同一租户用同一个 `Idempotency-Key` **同时**为**两条不同且有效**的源托管记录发起迁移时，
 > 两侧源 custody 行锁互不重叠，可能**双双通过预查**（幂等键、源/目标有效性、同源在途拦截
@@ -61,7 +84,9 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > 补一条 `migration.start` denied 审计**；胜方会话提交后可 `GET /migrations/{id}` 查询。
 > 回归验证见 `scripts/race_migration_start.py` 的 S1/S2（预查后交错：恰一次 201、败方稳定
 > 409 且只留拒绝审计）、S3（同键同源并发得 200 同一份）、S4（异键同源得
-> `MIGRATION_CONFLICT`）、S5/S6（非目标约束 23505 与通用故障仍为 500，可干净重试）。
+> `MIGRATION_CONFLICT`）、S5/S6（非目标约束 23505 与通用故障仍为 500，可干净重试）；
+> v1.7.1 增补 S7/S8/S9，钉住保存点回滚后、重读前胜方 open→completed/destroyed 的
+> 交错（见上条修复要点）。
 
 > **修复要点（v1.5）**：修复**跨策略迁移在待累计分片丢失后卡死**的问题。旧代码里，首名托管人
 > 已提交分片（数据库计数=1）后若 API 进程重启或内存池淘汰该分片，另一名托管人的提交会让
@@ -170,7 +195,7 @@ docker compose exec api python -m app.seed
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
 # 2) 迁移缺片故障转移回归（scripts.race_migration，37 项）
-# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S6）
+# 3) 迁移创建并发幂等回归（scripts.race_migration_start，S1–S9）
 # 4) 谱系逻辑销毁回归（scripts.race_destruction，D1–D9）
 # 5) 端到端验收（scripts.demo，含销毁全流程）
 docker compose --profile demo run --rm demo
@@ -196,7 +221,13 @@ docker compose --profile demo run --rm demo
 审计**、单独补一条 `migration.start`/`denied` 审计，胜方会话可 GET 查询；同键同源的并发创建在源
 行锁上排队后按幂等重放返回 **200 同一份会话**（S3）；不同键同源排队者得 409
 `MIGRATION_CONFLICT`（S4）；预查后注入的**非目标约束 23505**（S5）与通用故障（S6）一律 500，
-绝不误判为幂等冲突，回滚后同键可干净重试。
+绝不误判为幂等冲突，回滚后同键可干净重试。S7 另以 `migration.after_idem_conflict` 闸门钉住
+**保存点回滚之后、重读胜方之前**的窗口：败方 park 期间胜方在另一条源上正常跑完门限
+`open`→`completed`，断言败方仍稳定得到 409（basis `winner_status=completed`，不再冒出 500、
+不丢拒绝审计）、同请求对 completed 胜方 200 重放同一新 custody、败方换新键后可独立完成；
+S8 在同一窗口让胜方 `open`→`destroyed`，断言终态行不充当赢家、败方重新校验后 201 且只留
+自己的成功审计（`expired`/`failed` 同规则）；S9 断言该窗口注入的通用故障仍是 500，不被
+吞成冲突或静默重试。
 `scripts.race_destruction.py` 钉住**逻辑销毁 × 迁移完成/分片领取/份额提交**的行锁交错
 （销毁在持谱系 custody 锁、会话锁前 park，使在途请求排队）：断言先后确定、输掉交错的旧会话
 只得到 `CUSTODY_DESTROYED`（不再下发分片/密文、不产生漏删后代）、迁移先赢时新后代必被纳入
@@ -378,6 +409,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/migrations \
       "reason": "concurrent_open_with_same_idempotency_key",
       "idempotency_key_digest": "d2e9dd221ece913ad8eced5511edc37f7514aa7bc532b4434ad98e61519249c8",
       "migration_id": "mig_2933ebd24b57824c53eca9b7",
+      "winner_status": "open",
       "winner_source_custody_id": "cus_secret_30bf8fa9491b0fa26a9c66a2"
     }
   }
@@ -385,9 +417,36 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/migrations \
 ```
 
 > 串行预查命中时 `reason` 为 `key_bound_to_different_request`；并发后插入者的 basis 为
-> `concurrent_open_with_same_idempotency_key` 并带胜方 `migration_id`。败方会话插入随
+> `concurrent_open_with_same_idempotency_key` 并带胜方 `migration_id` 与
+> `winner_status`（`open` 或 `completed`：即使败方在 savepoint 回滚后重读前胜方已
+> 完成，也按已提交的 completed 会话裁决，绝不冒出 500）。败方会话插入随
 > savepoint 回滚——**不留下迁移会话、不留成功审计**，拒绝由独立事务单独记一条
 > `migration.start` / `denied` / `IDEMPOTENCY_CONFLICT` 审计；换新幂等键即可从该源记录重试。
+>
+> 即使败方在 savepoint 回滚后、重读胜方前，胜方已由其源托管人跑完门限转为
+> `completed`，裁决仍按**已提交的 completed 会话**进行（下例来自 S7 交错的真实响应，
+> 摘要随运行变化）：
+>
+> ```json
+> {
+>   "error": {
+>     "code": "IDEMPOTENCY_CONFLICT",
+>     "message": "idempotency key is already bound to a different request",
+>     "basis": {
+>       "reason": "concurrent_open_with_same_idempotency_key",
+>       "idempotency_key_digest": "590595b748d3648c9485963e343c65e7a06762c8398481c21a7baab42c55ea15",
+>       "migration_id": "mig_2c3d33f5f19bd448cfbd6412",
+>       "winner_status": "completed",
+>       "winner_source_custody_id": "cus_secret_dcf8e9c807e003e551ced932"
+>     }
+>   }
+> }
+> ```
+>
+> 此时同键**同请求体**重放仍返回 **200** 且 `new_custody_id` 与胜方完成时的那一个
+> 完全一致；败方换新键可从自己的（未被迁移的）源独立发起并完成。若胜方在该窗口进入
+> `expired`/`failed`/`destroyed`，终态行不占索引、不充当赢家，败方在源行锁内重新
+> 校验源/目标后直接拿到自己的 **201** 新会话。
 
 不同键对同一源 custody 发起（在途）返回 **409 `MIGRATION_CONFLICT`**：
 
@@ -482,11 +541,17 @@ curl -s localhost:8000/migrations/mig_2933ebd24b57824c53eca9b7 -H "X-API-Key: $T
   直接换新幂等键（或沿用同一键）重新 `POST /migrations` 即可从源记录再发起；
   失败会话没有 `new_custody_id`，重试完成前不会产生任何新托管记录，完成后也全局唯一。
 - 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底。唯一违规按**实际命中的约束名**分派
-  （绝不只凭 SQLSTATE=23505）：
+  （绝不只凭 SQLSTATE=23505），且保存点回滚后**按已提交会话的真实状态重读**
+  （`open`/`completed` 都可能是赢家；`expired`/`failed`/`destroyed` 行不占索引、
+  绝不充当赢家，败方在仍持有的源行锁内重新校验源/目标后按终态后重建规则重新创建）：
   - 同键**同源**并发：后到者在源行锁上排队，胜方提交后经预查重放，返回 **200 同一份会话**；
   - 同键**异源**并发（行锁互不重叠、双双通过预查）：后插入者撞 `uq_migration_idem_open`，
     返回 409 `IDEMPOTENCY_CONFLICT`（reason=`concurrent_open_with_same_idempotency_key`，
-    basis 带胜方 `migration_id`），败方不留下会话/成功审计，单独补拒绝审计，换新键可重试；
+    basis 带胜方 `migration_id` 与 `winner_status`）。即使败方重读前胜方已由 open 跑完
+    门限转为 **completed**，也按该已完成会话裁决：异请求稳定 409、同请求 200 重放
+    （completed 重放返回同一新 custody）；若胜方在该窗口进入 expired/failed/destroyed，
+    则不充当赢家，败方重新校验后创建自己的会话（201）；败方不留会话/成功审计，
+    409 单独补拒绝审计，换新键可重试；
   - 不同键同源并发：排队者预查命中在途会话，返回 409 `MIGRATION_CONFLICT`
     （`open_migration_exists_for_custody`；已完成则 `custody_already_migrated`）；
   - 非目标约束的 23505（如主键冲突）或其它数据库错误**原样上抛为 500，绝不误判**为冲突。
